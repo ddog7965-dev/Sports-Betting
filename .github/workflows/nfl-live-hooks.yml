@@ -1,0 +1,540 @@
+name: NFL Live Hooks — Fully Auto
+
+on:
+  schedule:
+    # Runs three times daily during NFL season windows (adjust as needed)
+    - cron: '30 12 * 9-12,1-2'   # 12:30 UTC ~ early AM CT (Sep–Dec, Jan–Feb)
+    - cron: '30 16 * 9-12,1-2'   # 16:30 UTC ~ late AM CT
+    - cron: '30 20 * 9-12,1-2'   # 20:30 UTC ~ afternoon CT
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    env:
+      TZ: America/Chicago
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure repo structure
+        run: |
+          mkdir -p analyzer data .github/workflows
+
+      - name: Write requirements.txt (idempotent)
+        run: |
+          cat > requirements.txt << 'REQ'
+          requests
+          beautifulsoup4
+          REQ
+
+      - name: Restore or create live_hooks.py (self-contained)
+        run: |
+          if [ -s analyzer/live_hooks.py ]; then
+            echo "[ok] analyzer/live_hooks.py present"
+          else
+            echo "[make] analyzer/live_hooks.py"
+            cat > analyzer/live_hooks.py << 'PY'
+            # analyzer/live_hooks.py — v5.3.1 (Portable Fingerprint Mode)
+            # Live Adapters + Confidence Nudges for NFL (VegasInsider, Covers, ESPN, Action)
+            # Slate helpers + CLI: python -m analyzer.live_hooks --csv data/nfl_games.csv --out data/nfl_live_bundle.json
+            from __future__ import annotations
+            import json, os, re, time, random
+            from dataclasses import dataclass, field, asdict
+            from typing import Dict, List, Optional
+            try:
+                import requests
+            except Exception:
+                requests = None
+            try:
+                from bs4 import BeautifulSoup
+            except Exception:
+                BeautifulSoup = None
+
+            USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            REQ_TIMEOUT = 8
+            SLEEP_BETWEEN_SOURCES = (0.35, 0.85)
+
+            @dataclass
+            class PublicSplit:
+                spread_pct_on_favorite: Optional[float]=None
+                moneyline_pct_on_favorite: Optional[float]=None
+                total_pct_on_over: Optional[float]=None
+                sample_size_label: Optional[str]=None
+                source: Optional[str]=None
+
+            @dataclass
+            class ConsensusLine:
+                spread_fav: Optional[str]=None
+                spread_num: Optional[float]=None
+                total_num: Optional[float]=None
+                ml_fav: Optional[str]=None
+                ml_price_fav: Optional[int]=None
+                ml_price_dog: Optional[int]=None
+                source: Optional[str]=None
+
+            @dataclass
+            class WeatherInfo:
+                roof: Optional[str]=None
+                temp_f: Optional[float]=None
+                wind_mph: Optional[float]=None
+                precip_prob: Optional[float]=None
+                source: Optional[str]=None
+                quality: str="unknown"
+
+            @dataclass
+            class InjuryPulse:
+                key_out_home: int=0
+                key_out_away: int=0
+                source: Optional[str]=None
+                quality: str="unknown"
+
+            @dataclass
+            class Nudge:
+                label: str
+                bps: int
+                why: str
+
+            @dataclass
+            class LiveBundle:
+                public_splits: Dict[str, PublicSplit]=field(default_factory=dict)
+                consensus: Dict[str, ConsensusLine]=field(default_factory=dict)
+                weather: WeatherInfo=field(default_factory=WeatherInfo)
+                injuries: InjuryPulse=field(default_factory=InjuryPulse)
+                nudges: List[Nudge]=field(default_factory=list)
+                notes: List[str]=field(default_factory=list)
+
+            def _short_id(*parts: str, size: int = 10) -> str:
+                s = "|".join(p or "" for p in parts)
+                h = hex(abs(hash(s)))[2:]
+                return h[:size]
+
+            NFL_ROOF_MAP = {
+              "at&t stadium":"retractable","mercedes-benz stadium":"retractable","state farm stadium":"retractable","nrg stadium":"retractable",
+              "bank of america stadium":"outdoor","soldier field":"outdoor","lambeau field":"outdoor","lincoln financial field":"outdoor",
+              "metlife stadium":"outdoor","gillette stadium":"outdoor","m&t bank stadium":"outdoor","cleveland browns stadium":"outdoor",
+              "paycor stadium":"outdoor","acrisure stadium":"outdoor","geha field at arrowhead stadium":"outdoor","empower field at mile high":"outdoor",
+              "sofi stadium":"covered-open","u.s. bank stadium":"dome","lucas oil stadium":"retractable","caesars superdome":"dome",
+              "ford field":"dome","allegiant stadium":"dome","raymond james stadium":"outdoor","hard rock stadium":"outdoor",
+              "highmark stadium":"outdoor","everbank stadium":"outdoor","lumen field":"outdoor","levi's stadium":"outdoor","fedexfield":"outdoor"
+            }
+
+            def infer_roof_type(venue: Optional[str]) -> str:
+                if not venue: return "unknown"
+                key = venue.strip().lower()
+                for k,v in NFL_ROOF_MAP.items():
+                    if k in key: return v
+                return "unknown"
+
+            def _request(url: str, params: Optional[dict]=None, headers: Optional[dict]=None) -> Optional[str]:
+                if requests is None: return None
+                h = {"User-Agent": USER_AGENT}
+                if headers: h.update(headers)
+                try:
+                    r = requests.get(url, params=params, headers=h, timeout=REQ_TIMEOUT)
+                    if r.status_code == 200: return r.text
+                    return None
+                except Exception:
+                    return None
+
+            def _maybe_sleep():
+                lo, hi = SLEEP_BETWEEN_SOURCES
+                time.sleep(random.uniform(lo, hi))
+
+            def _parse_pct(val: str) -> Optional[float]:
+                if not val: return None
+                m = re.search(r'(\d{1,3}(?:\.\d+)?)\s*%', val.strip())
+                if m:
+                    x = float(m.group(1))
+                    if 0 <= x <= 100: return x
+                return None
+
+            class LiveHooks:
+                def __init__(self, league: str="nfl", tz: str="America/Chicago", proxies=None, enable_sources=None):
+                    self.league = league.lower()
+                    self.tz = tz
+                    self.proxies = proxies or {}
+                    self.enabled_public_sources = enable_sources or ["vegasinsider","covers","action"]
+                    self.enabled_consensus_sources = enable_sources or ["vegasinsider","covers","espn"]
+                    self.notes = []
+
+                def _vegasinsider_public(self, home: str, away: str):
+                    html = _request("https://www.vegasinsider.com/nfl/public-betting/")
+                    _maybe_sleep()
+                    if not html or BeautifulSoup is None: return None
+                    try:
+                        soup = BeautifulSoup(html,"html.parser")
+                        row=None
+                        for tr in soup.select("table tr"):
+                            ttxt=tr.get_text(" ",strip=True).lower()
+                            if home.lower() in ttxt or away.lower() in ttxt:
+                                row=tr;break
+                        if not row: return None
+                        cells=[c.get_text(" ",strip=True) for c in row.find_all(["td","th"])]
+                        pcts=[_parse_pct(c) for c in cells if _parse_pct(c) is not None]
+                        spread, money, total = (pcts + [None,None,None])[:3]
+                        return PublicSplit(spread, money, total, "tickets","vegasinsider")
+                    except Exception:
+                        return None
+
+                def _covers_public(self, home: str, away: str):
+                    html = _request("https://www.covers.com/sports/nfl/matchups")
+                    _maybe_sleep()
+                    if not html or BeautifulSoup is None: return None
+                    try:
+                        soup = BeautifulSoup(html,"html.parser")
+                        block=None
+                        for div in soup.select("div"):
+                            t=div.get_text(" ",strip=True).lower()
+                            if home.lower() in t and away.lower() in t and "%" in t:
+                                block=div;break
+                        if not block: return None
+                        txt=block.get_text(" ",strip=True)
+                        pcts=re.findall(r'(\d{1,3}(?:\.\d+)?)\s*%', txt)
+                        nums=[float(x) for x in pcts[:3]]
+                        spread = nums[0] if len(nums)>0 else None
+                        money  = nums[1] if len(nums)>1 else None
+                        total  = nums[2] if len(nums)>2 else None
+                        return PublicSplit(spread, money, total, "tickets","covers")
+                    except Exception:
+                        return None
+
+                def _action_public(self, home: str, away: str):
+                    html = _request("https://www.actionnetwork.com/nfl/public-betting")
+                    _maybe_sleep()
+                    if not html or BeautifulSoup is None: return None
+                    try:
+                        soup = BeautifulSoup(html,"html.parser")
+                        txt=soup.get_text(" ",strip=True)
+                        pcts=re.findall(r'(\d{1,3}(?:\.\d+)?)\s*%', txt)
+                        nums=[float(x) for x in pcts[:3]]
+                        return PublicSplit(
+                            nums[0] if len(nums)>0 else None,
+                            nums[1] if len(nums)>1 else None,
+                            nums[2] if len(nums)>2 else None,
+                            "tickets","action")
+                    except Exception:
+                        return None
+
+                def get_public_splits(self, home: str, away: str):
+                    out={}
+                    for src in self.enabled_public_sources:
+                        try:
+                            s=None
+                            if src=="vegasinsider": s=self._vegasinsider_public(home,away)
+                            elif src=="covers":     s=self._covers_public(home,away)
+                            elif src=="action":     s=self._action_public(home,away)
+                            if s: out[src]=s
+                        except Exception: pass
+                    if not out: self.notes.append("No public split sources resolved; proceeding without PublicFade nudges.")
+                    return out
+
+                def _vegasinsider_consensus(self, home: str, away: str):
+                    html=_request("https://www.vegasinsider.com/nfl/odds/consensus/"); _maybe_sleep()
+                    if not html or BeautifulSoup is None: return None
+                    try:
+                        soup=BeautifulSoup(html,"html.parser")
+                        row=None
+                        for tr in soup.select("table tr"):
+                            ttxt=tr.get_text(" ",strip=True).lower()
+                            if home.lower() in ttxt and away.lower() in ttxt:
+                                row=tr;break
+                        if not row: return None
+                        cells=[c.get_text(" ",strip=True) for c in row.find_all(["td","th"])]
+                        nums=[]
+                        for c in cells:
+                            for mm in re.findall(r'[-+]?(\\d+(?:\\.\\d)?)', c):
+                                try: nums.append(float(mm))
+                                except: pass
+                        spread = min(nums, key=lambda x:abs(x)) if nums else None
+                        total  = max(nums) if nums else None
+                        return ConsensusLine(spread_num=spread,total_num=total,source="vegasinsider")
+                    except Exception:
+                        return None
+
+                def _covers_consensus(self, home: str, away: str):
+                    html=_request("https://www.covers.com/sports/nfl/odds-consensus"); _maybe_sleep()
+                    if not html or BeautifulSoup is None: return None
+                    try:
+                        soup=BeautifulSoup(html,"html.parser")
+                        block=None
+                        for div in soup.select("div"):
+                            t=div.get_text(" ",strip=True).lower()
+                            if home.lower() in t and away.lower() in t:
+                                block=div;break
+                        if not block: return None
+                        txt=block.get_text(" ",strip=True)
+                        totals=re.findall(r'(?i)(?:o/u|total)\\s*[: ]\\s*(\\d{2,3}(?:\\.\\d)?)', txt)
+                        spreads=re.findall(r'(?<!\\d)([-+]\\d{1,2}(?:\\.\\d)?)', txt)
+                        total_num=float(totals[0]) if totals else None
+                        spread_num=float(spreads[0]) if spreads else None
+                        return ConsensusLine(spread_num=spread_num,total_num=total_num,source="covers")
+                    except Exception:
+                        return None
+
+                def _espn_consensus(self, home: str, away: str):
+                    html=_request("https://www.espn.com/nfl/lines"); _maybe_sleep()
+                    if not html or BeautifulSoup is None: return None
+                    try:
+                        soup=BeautifulSoup(html,"html.parser")
+                        row=None
+                        for tr in soup.select("table tr"):
+                            t=tr.get_text(" ",strip=True).lower()
+                            if home.lower() in t and away.lower() in t: row=tr;break
+                        if not row: return None
+                        txt=row.get_text(" ",strip=True)
+                        totals=re.findall(r'(?i)(?:o/u|total)\\s*(\\d{2,3}(?:\\.\\d)?)', txt)
+                        spreads=re.findall(r'(?<!\\d)([-+]\\d{1,2}(?:\\.\\d)?)', txt)
+                        ml=re.findall(r'(?<!\\d)([-+]\\d{3,4})(?!\\d)', txt)
+                        total_num=float(totals[0]) if totals else None
+                        spread_num=float(spreads[0]) if spreads else None
+                        ml_price_fav=ml_price_dog=None
+                        if len(ml)>=2:
+                            prices=[int(x) for x in ml[:2]]
+                            ml_price_fav=min(prices); ml_price_dog=max(prices)
+                        return ConsensusLine(spread_num=spread_num,total_num=total_num,ml_price_fav=ml_price_fav,ml_price_dog=ml_price_dog,source="espn")
+                    except Exception:
+                        return None
+
+                def get_consensus(self, home: str, away: str):
+                    out={}
+                    for src in self.enabled_consensus_sources:
+                        try:
+                            c=None
+                            if src=="vegasinsider": c=self._vegasinsider_consensus(home,away)
+                            elif src=="covers":     c=self._covers_consensus(home,away)
+                            elif src=="espn":       c=self._espn_consensus(home,away)
+                            if c: out[src]=c
+                        except Exception: pass
+                    if not out: self.notes.append("No consensus line sources resolved; model should rely on book-offer lines only.")
+                    return out
+
+                def get_weather(self, venue: Optional[str], city: Optional[str]) -> WeatherInfo:
+                    roof=infer_roof_type(venue or "")
+                    info=WeatherInfo(roof=("closed" if roof in ["dome"] else roof), source=None, quality="unknown")
+                    if roof in ["dome"]:
+                        info.quality="good"; info.source="roof-map"; info.temp_f=70.0; info.wind_mph=0.0; info.precip_prob=0.0; return info
+                    if requests is not None and city:
+                        try:
+                            g=requests.get("https://geocoding-api.open-meteo.com/v1/search",params={"name":city,"count":1},timeout=REQ_TIMEOUT)
+                            if g.status_code==200 and g.json().get("results"):
+                                lat=g.json()["results"][0]["latitude"]; lon=g.json()["results"][0]["longitude"]
+                                w=requests.get("https://api.open-meteo.com/v1/forecast",
+                                   params={"latitude":lat,"longitude":lon,"hourly":"temperature_2m,precipitation_probability,wind_speed_10m","forecast_days":1},
+                                   timeout=REQ_TIMEOUT)
+                                if w.status_code==200:
+                                    wj=w.json(); temp=wind=pop=None
+                                    try:
+                                        temp=float(wj["hourly"]["temperature_2m"][0]); wind=float(wj["hourly"]["wind_speed_10m"][0]); pop=float(wj["hourly"]["precipitation_probability"][0])/100.0
+                                    except Exception: pass
+                                    info.temp_f=None if temp is None else (temp*9/5+32); info.wind_mph=wind; info.precip_prob=pop; info.source="open-meteo"; info.quality="ok"; return info
+                        except Exception: pass
+                    info.source="roof-map"; info.quality="unknown" if roof=="unknown" else "ok"; return info
+
+                def get_injuries(self, home: str, away: str) -> InjuryPulse:
+                    from pathlib import Path
+                    p=Path("data/nfl_injuries_rollup.csv"); pulse=InjuryPulse(source=None,quality="unknown")
+                    if p.exists():
+                        try:
+                            lines=p.read_text(encoding="utf-8").splitlines()
+                            data=[ln.split(",") for ln in lines[1:] if ln.strip()]
+                            m={ team.strip().lower(): int((cnt or "0").strip()) for team,cnt in data if len(data) }
+                            pulse.key_out_home=m.get(home.lower(),0); pulse.key_out_away=m.get(away.lower(),0)
+                            pulse.source="csv"; pulse.quality="ok"; return pulse
+                        except Exception: pass
+                    pulse.source="none"; pulse.quality="unknown"; return pulse
+
+                def compute_nudges(self, market: str, favorite_team: Optional[str], public: Dict[str,PublicSplit], weather: WeatherInfo, injuries: InjuryPulse):
+                    nudges=[]
+                    try:
+                        if market in ["spread","moneyline"] and favorite_team:
+                            vals=[]
+                            for s in public.values():
+                                if market=="spread" and s.spread_pct_on_favorite is not None: vals.append(s.spread_pct_on_favorite)
+                                if market=="moneyline" and s.moneyline_pct_on_favorite is not None: vals.append(s.moneyline_pct_on_favorite)
+                            if vals:
+                                avg=sum(vals)/len(vals)
+                                if avg>=65: nudges.append(Nudge("PublicFade",-15 if avg>=70 else -10,f"{avg:.0f}% on favorite across public sources"))
+                                elif avg<=35: nudges.append(Nudge("ContrarianEdge",+15 if avg<=30 else +10,f"{avg:.0f}% on favorite (dog favored by public)"))
+                    except Exception: pass
+                    try:
+                        if market=="total":
+                            if weather.roof in ["dome","closed"]: nudges.append(Nudge("Roof",+5,"Indoor conditions stabilize scoring"))
+                            elif weather.wind_mph is not None:
+                                if weather.wind_mph>=15: nudges.append(Nudge("Wind",-15,f"Wind {weather.wind_mph:.0f} mph — under bias"))
+                                elif weather.wind_mph>=10: nudges.append(Nudge("Wind",-8,f"Wind {weather.wind_mph:.0f} mph — slight under bias"))
+                            if weather.precip_prob is not None and weather.precip_prob>=0.5: nudges.append(Nudge("Precip",-6,f"High precip probability ~{int(weather.precip_prob*100)}%"))
+                    except Exception: pass
+                    try:
+                        delta=injuries.key_out_home - injuries.key_out_away
+                        if delta!=0 and market in ["spread","moneyline"]:
+                            adj=-4*delta; direction="away healthier" if delta>0 else "home healthier"
+                            nudges.append(Nudge("Injuries",int(adj),f"Key outs delta={delta} ({direction})"))
+                    except Exception: pass
+                    for n in nudges:
+                        n.bps=max(-25,min(25,n.bps))
+                    return nudges
+
+                def get_live_bundle(self, home_team: str, away_team: str, venue: Optional[str]=None, city: Optional[str]=None, kickoff_iso: Optional[str]=None) -> LiveBundle:
+                    bundle=LiveBundle()
+                    bundle.public_splits=self.get_public_splits(home_team,away_team)
+                    bundle.consensus=self.get_consensus(home_team,away_team)
+                    bundle.weather=self.get_weather(venue,city)
+                    bundle.injuries=self.get_injuries(home_team,away_team)
+                    for m in ["spread","total","moneyline"]:
+                        bundle.nudges.extend(self.compute_nudges(m, favorite_team=home_team, public=bundle.public_splits, weather=bundle.weather, injuries=bundle.injuries))
+                    total_bps=max(-50,min(50,sum(n.bps for n in bundle.nudges)))
+                    bundle.notes.append(f"Nudges total (clamped): {total_bps} bps")
+                    if not bundle.public_splits: bundle.notes.append("Public splits unavailable — skipping PublicFade/ContrarianEdge in final scoring.")
+                    if bundle.weather.quality=="unknown": bundle.notes.append("Weather unknown quality — weather nudges suppressed unless roof-known.")
+                    if bundle.injuries.quality=="unknown": bundle.notes.append("Injuries unknown — injury nudges use 0 by default unless csv provided.")
+                    return bundle
+
+                def load_games_from_csv(self, csv_path: str) -> List[dict]:
+                    from pathlib import Path
+                    p=Path(csv_path)
+                    lines=p.read_text(encoding="utf-8").splitlines()
+                    header=[h.strip() for h in lines[0].split(",")]
+                    idx={n:i for i,n in enumerate(header)}
+                    need=["home_team","away_team","venue","city","kickoff_iso"]
+                    for k in need:
+                        if k not in idx: raise ValueError(f"CSV missing column: {k}")
+                    rows=[]
+                    for ln in lines[1:]:
+                        if not ln.strip(): continue
+                        parts=[x.strip() for x in ln.split(",")]
+                        row={ k: (parts[idx[k]] if idx[k]<len(parts) else "") for k in need }
+                        if row["home_team"] and row["away_team"]: rows.append(row)
+                    return rows
+
+                def get_slate_bundles(self, games: List[dict]) -> Dict[str, LiveBundle]:
+                    out={}
+                    for g in games:
+                        home=g.get("home_team","").strip(); away=g.get("away_team","").strip()
+                        venue=(g.get("venue","") or "").strip() or None
+                        city=(g.get("city","") or "").strip() or None
+                        kickoff=(g.get("kickoff_iso","") or "").strip() or None
+                        if not home or not away: continue
+                        key=_short_id(home,away,kickoff or "")
+                        out[key]=self.get_live_bundle(home,away,venue=venue,city=city,kickoff_iso=kickoff)
+                    return out
+
+            def _cli():
+                import argparse, sys, json
+                parser=argparse.ArgumentParser(description="NFL Live Hooks — slate bundler")
+                parser.add_argument("--csv", required=True, help="CSV path with home_team,away_team,venue,city,kickoff_iso")
+                parser.add_argument("--out", default="data/nfl_live_bundle.json", help="Output JSON path")
+                a=parser.parse_args()
+                hooks=LiveHooks(league="nfl")
+                games=hooks.load_games_from_csv(a.csv)
+                bundles=hooks.get_slate_bundles(games)
+                obj={}
+                for k,b in bundles.items():
+                    obj[k]={"public_splits":{s:asdict(ps) for s,ps in b.public_splits.items()},
+                            "consensus":{s:asdict(cs) for s,cs in b.consensus.items()},
+                            "weather":asdict(b.weather),
+                            "injuries":asdict(b.injuries),
+                            "nudges":[asdict(n) for n in b.nudges],
+                            "notes":b.notes}
+                from pathlib import Path
+                Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+                with open(a.out,"w",encoding="utf-8") as f: json.dump(obj,f,indent=2)
+                print(f"[ok] wrote {a.out} with {len(bundles)} games")
+            if __name__=="__main__": _cli()
+            PY
+          fi
+
+      - name: Install Python & deps
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build weekly slate from ESPN (next Sunday, CT) → data/nfl_games.csv
+        run: |
+          python - << 'PY'
+          import sys, json, datetime, csv
+          from zoneinfo import ZoneInfo
+          import requests
+
+          tz = ZoneInfo("America/Chicago")
+          today = datetime.datetime.now(tz).date()
+          days_ahead = (6 - today.weekday()) % 7  # Sunday=6
+          target = today + datetime.timedelta(days=days_ahead)
+          datestr = target.strftime("%Y%m%d")
+
+          url = f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?dates={datestr}"
+          r = requests.get(url, timeout=15)
+          r.raise_for_status()
+          data = r.json()
+
+          rows = []
+          for ev in data.get("events", []):
+            c = ev.get("competitions", [{}])[0]
+            comps = c.get("competitors", [])
+            if len(comps) != 2:
+              continue
+            home = next((t for t in comps if t.get("homeAway")=="home"), None)
+            away = next((t for t in comps if t.get("homeAway")=="away"), None)
+            if not home or not away:
+              continue
+            home_name = home["team"]["displayName"]
+            away_name = away["team"]["displayName"]
+            venue = (c.get("venue") or {}).get("fullName") or ""
+            addr = (c.get("venue") or {}).get("address") or {}
+            city = ", ".join([x for x in [addr.get("city",""), addr.get("state","")] if x]).strip(", ")
+            kickoff_iso = c.get("date") or ""
+
+            rows.append({
+              "home_team": home_name,
+              "away_team": away_name,
+              "venue": venue,
+              "city": city,
+              "kickoff_iso": kickoff_iso
+            })
+
+          import os
+          os.makedirs("data", exist_ok=True)
+          with open("data/nfl_games.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["home_team","away_team","venue","city","kickoff_iso"])
+            w.writeheader()
+            w.writerows(rows)
+
+          print(f"[ok] wrote data/nfl_games.csv with {len(rows)} games for {target}")
+          PY
+
+      - name: Ensure injuries CSV exists (optional)
+        run: |
+          if [ ! -s data/nfl_injuries_rollup.csv ]; then
+            echo "team,key_out_count" > data/nfl_injuries_rollup.csv
+          fi
+
+      - name: Run live adapters across FULL slate
+        id: hooks
+        run: |
+          python -m analyzer.live_hooks --csv data/nfl_games.csv --out data/nfl_live_bundle.json
+          TS=$(date '+%Y%m%d_%H%M')
+          cp data/nfl_live_bundle.json "data/nfl_live_bundle_${TS}.json"
+          echo "ts=$TS" >> $GITHUB_OUTPUT
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfl_live_bundle
+          path: |
+            data/nfl_live_bundle.json
+            data/nfl_live_bundle_${{ steps.hooks.outputs.ts }}.json
+
+      - name: Commit & push outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/nfl_games.csv data/nfl_live_bundle.json data/nfl_live_bundle_*.json analyzer/live_hooks.py requirements.txt
+          git commit -m "auto: update slate + live bundle ($(date -u '+%Y-%m-%d %H:%M UTC'))" || echo "No changes to commit"
+          git push || true
