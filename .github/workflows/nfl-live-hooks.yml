@@ -474,10 +474,52 @@ jobs:
             data/nfl_live_bundle.json
             data/nfl_live_bundle_${{ steps.hooks.outputs.ts }}.json
 
-      - name: Commit & push outputs
+      - name: Update README live table
+        run: |
+          python - << 'PY'
+          import json, re
+          from pathlib import Path
+
+          def avg_public(ps):
+            vals=[float(s.get("spread_pct_on_favorite")) for s in ps.values() if isinstance(s.get("spread_pct_on_favorite"), (int,float))]
+            return round(sum(vals)/len(vals),1) if vals else None
+
+          p = Path("data/nfl_live_bundle.json")
+          if not p.exists():
+            raise SystemExit("live bundle missing — skip README update")
+          obj = json.loads(p.read_text(encoding="utf-8"))
+
+          rows=[]
+          for k,b in obj.items():
+            cons=b.get("consensus",{})
+            sp=tot=None
+            for v in cons.values():
+              if sp is None and isinstance(v.get("spread_num"), (int,float)): sp=v["spread_num"]
+              if tot is None and isinstance(v.get("total_num"), (int,float)):  tot=v["total_num"]
+            pub = avg_public(b.get("public_splits",{}))
+            nudge_total = max(-50, min(50, sum(int(n.get("bps",0)) for n in b.get("nudges",[]))))
+            rows.append((k, sp, tot, pub, nudge_total))
+
+          header = "| Matchup ID | Spread* | Total* | Public% on Fav* | Nudge Sum (bps) |\n|---|---:|---:|---:|---:|"
+          def fmt(x): return "—" if x is None else (f"{x:.1f}" if isinstance(x,float) else str(x))
+          lines=[header]+[f"| `{k}` | {fmt(sp)} | {fmt(tot)} | {fmt(pub)} | {nud:+d} |" for k,sp,tot,pub,nud in sorted(rows)]
+          table = "\n".join(lines) if rows else "_no games found_"
+
+          readme = Path("README.md")
+          txt = readme.read_text(encoding="utf-8")
+          start="<!-- LIVE_BUNDLE:START -->"; end="<!-- LIVE_BUNDLE:END -->"
+          if start in txt and end in txt:
+            txt = re.sub(f"{start}[\\s\\S]*?{end}", f"{start}\n{table}\n{end}", txt)
+          else:
+            txt += "\n\n## Live Slate Summary\n" + start + "\n" + table + "\n" + end + "\n"
+          readme.write_text(txt, encoding="utf-8")
+          print("[ok] README updated")
+          PY
+
+      - name: Commit & push outputs + README
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/nfl_games.csv data/nfl_live_bundle.json data/nfl_live_bundle_*.json analyzer/live_hooks.py requirements.txt
-          git commit -m "auto: update slate + live bundle ($(date -u '+%Y-%m-%d %H:%M UTC'))" || echo "No changes to commit"
+          git add README.md data/nfl_games.csv data/nfl_live_bundle.json data/nfl_live_bundle_*.json analyzer/live_hooks.py requirements.txt
+          git commit -m "auto: update slate + live bundle + README ($(date -u '+%Y-%m-%d %H:%M UTC'))" || echo "No changes to commit"
           git push || true
