@@ -3,9 +3,9 @@ name: NFL Live Hooks — Fully Auto
 on:
   schedule:
     # Runs three times daily during NFL season windows (adjust as needed)
-    - cron: '30 12 * 9-12,1-2'   # 12:30 UTC ~ early AM CT (Sep–Dec, Jan–Feb)
-    - cron: '30 16 * 9-12,1-2'   # 16:30 UTC ~ late AM CT
-    - cron: '30 20 * 9-12,1-2'   # 20:30 UTC ~ afternoon CT
+    - cron: '30 12 * 9-12,1-2 *'   # 12:30 UTC ~ early AM CT (Sep–Dec, Jan–Feb)
+    - cron: '30 16 * 9-12,1-2 *'   # 16:30 UTC ~ late AM CT
+    - cron: '30 20 * 9-12,1-2 *'   # 20:30 UTC ~ afternoon CT
   workflow_dispatch: {}
 
 permissions:
